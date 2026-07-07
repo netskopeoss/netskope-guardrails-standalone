@@ -1,0 +1,536 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Netskope AI Guardrails — standalone deployment.
+
+  Deploys the AI Guardrails LLM container onto a GPU instance in an existing
+  VPC, behind a private Application Load Balancer with a self-signed CA
+  certificate. The container self-starts on boot via EC2 UserData (ECR login
+  -> docker pull -> docker run --gpus all) — there are no lifecycle hooks,
+  SNS, Step Functions, or tethering Lambdas. The only Lambda is the inline
+  self-signed-certificate custom resource.
+
+  Carved out of the AWS-AIGW Reference Architecture (jharris-ns) to deploy
+  ONLY the AI Guardrails service, with no AI Gateway or DLPoD resources.
+
+  No prebuilt artifacts are required — the entire stack (including the cert
+  generator) is inlined, so deployment is a single `aws cloudformation deploy`.
+
+# ============================================================
+# Parameters
+# ============================================================
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC to deploy AI Guardrails into.
+
+  AlbSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Two subnets in different AZs for the internal ALB. Public or private
+      both work (the ALB is internal regardless). Each subnet must have at
+      least 8 free IPs (/24 or larger recommended; /28 is too small).
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      One or two private subnets WITH outbound internet (NAT gateway) for the
+      GPU instance(s). Outbound is required so the instance can authenticate
+      to ECR and pull the guardrails container image. Use AZs that have GPU
+      capacity for the chosen instance type.
+
+  GuardrailsAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >
+      Deep Learning Base AMI ID with NVIDIA drivers and Docker preinstalled
+      (e.g. AWS "Deep Learning Base OSS Nvidia Driver GPU AMI"). Must support
+      the chosen GPU instance type.
+
+  GuardrailsInstanceType:
+    Type: String
+    Default: g4dn.xlarge
+    AllowedValues:
+      - g4dn.xlarge
+      - g4dn.2xlarge
+      - g5.xlarge
+      - g5.2xlarge
+    Description: >
+      GPU instance type for guardrails. Requires 1 NVIDIA GPU with >= 16 GB
+      VRAM. g4dn (T4) is cheapest and broadly available; g5 (A10G) is faster
+      but may be quota/AZ constrained.
+
+  GuardrailsImageUri:
+    Type: String
+    Description: >
+      ECR image URI for the AI Guardrails LLM container, e.g.
+      196420666220.dkr.ecr.us-west-1.amazonaws.com/aisecurityllm:latest.
+      The instance authenticates to this registry via its IAM role and pulls
+      the image on boot. Required.
+
+  GuardrailsContainerPort:
+    Type: Number
+    Default: 8080
+    Description: Port the guardrails container listens on (published on the host and targeted by the ALB).
+
+  GuardrailsHealthCheckPath:
+    Type: String
+    Default: /
+    Description: ALB health check path for the guardrails container.
+
+  HostedZoneName:
+    Type: String
+    Default: aigw.internal
+    Description: >
+      Name of the Route 53 PRIVATE hosted zone to create and associate with
+      the VPC. Must be unique per VPC — if a zone with this name is already
+      associated with the VPC (e.g. from an AI Gateway or DLPoD deployment),
+      choose a different name (e.g. guardrails.internal) to avoid a
+      resolution collision.
+
+  GuardrailsDomainName:
+    Type: String
+    Default: guardrails.aigw.internal
+    Description: >
+      Internal FQDN clients (e.g. an AI Gateway) use to reach the Guardrails
+      ALB. Must be within HostedZoneName. The self-signed ALB certificate
+      CN/SAN matches this name.
+
+  GuardrailsMinCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Minimum number of guardrails GPU instances.
+
+  GuardrailsMaxCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Maximum number of guardrails GPU instances (allows manual scale-out).
+
+  GuardrailsDesiredCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Desired number of guardrails GPU instances (typically 1).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - AlbSubnetIds
+          - PrivateSubnetIds
+      - Label:
+          default: Guardrails GPU Appliance & Container
+        Parameters:
+          - GuardrailsAmiId
+          - GuardrailsInstanceType
+          - GuardrailsImageUri
+          - GuardrailsContainerPort
+          - GuardrailsHealthCheckPath
+      - Label:
+          default: DNS & Certificate
+        Parameters:
+          - HostedZoneName
+          - GuardrailsDomainName
+      - Label:
+          default: Scaling
+        Parameters:
+          - GuardrailsMinCapacity
+          - GuardrailsDesiredCapacity
+          - GuardrailsMaxCapacity
+    ParameterLabels:
+      GuardrailsAmiId: { default: Guardrails GPU AMI ID }
+      GuardrailsImageUri: { default: Guardrails ECR Image URI }
+      GuardrailsDomainName: { default: Guardrails Internal FQDN }
+      GuardrailsContainerPort: { default: Container Port }
+
+Resources:
+
+  # =========================================================
+  # Cert storage
+  # =========================================================
+
+  GuardrailsCertParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${AWS::StackName}/guardrails-cert'
+      Type: String
+      Value: pending
+      Description: >
+        Self-signed ALB certificate PEM (populated by the cert generator
+        custom resource). Import this into your AI Gateway / client trust
+        store so it can validate the Guardrails ALB endpoint.
+
+  # =========================================================
+  # Security Groups
+  # =========================================================
+
+  GuardrailsAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB for AI Guardrails service
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '10.0.0.0/8'
+          Description: HTTPS from RFC1918 10.x
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '172.16.0.0/12'
+          Description: HTTPS from RFC1918 172.x
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '192.168.0.0/16'
+          Description: HTTPS from RFC1918 192.x
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref GuardrailsContainerPort
+          ToPort: !Ref GuardrailsContainerPort
+          CidrIp: '0.0.0.0/0'
+          Description: HTTP to guardrails container
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails-alb-sg'
+
+  GuardrailsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AI Guardrails GPU instances
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref GuardrailsContainerPort
+          ToPort: !Ref GuardrailsContainerPort
+          SourceSecurityGroupId: !Ref GuardrailsAlbSecurityGroup
+          Description: Container port from ALB
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: All outbound (ECR pull, CloudWatch)
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails-sg'
+
+  # =========================================================
+  # Route 53 private hosted zone
+  # =========================================================
+
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref HostedZoneName
+      VPCs:
+        - VPCId: !Ref VpcId
+          VPCRegion: !Ref 'AWS::Region'
+      HostedZoneConfig:
+        Comment: !Sub 'Private zone for ${AWS::StackName} Guardrails ALB'
+
+  GuardrailsDnsRecord:
+    Type: AWS::Route53::RecordSet
+    DependsOn: GuardrailsAlb
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Ref GuardrailsDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt GuardrailsAlb.DNSName
+        HostedZoneId: !GetAtt GuardrailsAlb.CanonicalHostedZoneID
+
+  # =========================================================
+  # Self-signed CA certificate -> ACM + SSM (inline custom resource)
+  # =========================================================
+
+  CertGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-certgen-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CertGenPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm:ImportCertificate
+                  - acm:DeleteCertificate
+                  - acm:AddTagsToCertificate
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  CertGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-certgen'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt CertGeneratorRole.Arn
+      Code:
+        ZipFile: |
+          import json, subprocess, tempfile, os, logging, urllib.request, boto3
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          acm = boto3.client('acm')
+          ssm = boto3.client('ssm')
+          def send_cfn(event, context, status, data={}, pid=None):
+              body = json.dumps({'Status': status, 'Reason': f'See CloudWatch {context.log_group_name}/{context.log_stream_name}', 'PhysicalResourceId': pid or event.get('PhysicalResourceId','none'), 'StackId': event['StackId'], 'RequestId': event['RequestId'], 'LogicalResourceId': event['LogicalResourceId'], 'Data': data}).encode()
+              urllib.request.urlopen(urllib.request.Request(event['ResponseURL'], data=body, headers={'Content-Type':'','Content-Length':str(len(body))}, method='PUT'))
+          def handler(event, context):
+              domain = event['ResourceProperties']['DomainName']
+              cert_param = event['ResourceProperties']['CertParameterName']
+              stack = event['ResourceProperties']['StackName']
+              rt = event['RequestType']
+              try:
+                  if rt in ('Create', 'Update'):
+                      with tempfile.TemporaryDirectory() as d:
+                          kf, cf, sc = f'{d}/k.pem', f'{d}/c.pem', f'{d}/s.cnf'
+                          subprocess.run(['openssl','genrsa','-out',kf,'2048'], check=True, capture_output=True)
+                          with open(sc,'w') as f:
+                              f.write(f"[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n[dn]\nCN={domain}\nO=Netskope\nOU=AI Guardrails\n[v3]\nsubjectAltName=DNS:{domain}\nbasicConstraints=critical,CA:TRUE\nkeyUsage=digitalSignature,keyEncipherment,keyCertSign\nextendedKeyUsage=serverAuth\n")
+                          subprocess.run(['openssl','req','-new','-x509','-key',kf,'-out',cf,'-days','365','-config',sc], check=True, capture_output=True)
+                          cert_pem = open(cf).read()
+                          key_pem = open(kf).read()
+                      r = acm.import_certificate(Certificate=cert_pem.encode(), PrivateKey=key_pem.encode(), Tags=[{'Key':'StackName','Value':stack}])
+                      arn = r['CertificateArn']
+                      ssm.put_parameter(Name=cert_param, Value=cert_pem, Type='String', Overwrite=True)
+                      send_cfn(event, context, 'SUCCESS', {'CertificateArn': arn}, arn)
+                  elif rt == 'Delete':
+                      arn = event.get('PhysicalResourceId','')
+                      if arn.startswith('arn:'):
+                          try: acm.delete_certificate(CertificateArn=arn)
+                          except: pass
+                      send_cfn(event, context, 'SUCCESS', {}, arn)
+              except Exception:
+                  logger.exception('Failed')
+                  send_cfn(event, context, 'FAILED', {}, 'FAILED')
+
+  GuardrailsCertificate:
+    Type: Custom::AlbCertificate
+    Properties:
+      ServiceToken: !GetAtt CertGeneratorFunction.Arn
+      DomainName: !Ref GuardrailsDomainName
+      CertParameterName: !Sub '/${AWS::StackName}/guardrails-cert'
+      StackName: !Ref 'AWS::StackName'
+      CertVersion: '1'
+
+  # =========================================================
+  # Private ALB fronting the Guardrails container
+  # =========================================================
+
+  GuardrailsAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-guardrails'
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !Ref GuardrailsAlbSecurityGroup
+      Subnets: !Ref AlbSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails-alb'
+
+  GuardrailsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-guardrails-tg'
+      Protocol: HTTP
+      Port: !Ref GuardrailsContainerPort
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: !Sub '${GuardrailsContainerPort}'
+      HealthCheckPath: !Ref GuardrailsHealthCheckPath
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: 200-499
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails-tg'
+
+  GuardrailsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref GuardrailsAlb
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !GetAtt GuardrailsCertificate.CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GuardrailsTargetGroup
+
+  # =========================================================
+  # Guardrails GPU appliance — IAM, Launch Template + ASG
+  # Container self-starts via UserData (ECR pull + docker run).
+  # =========================================================
+
+  GuardrailsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-guardrails-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EcrPullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+
+  GuardrailsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-guardrails-profile'
+      Roles:
+        - !Ref GuardrailsRole
+
+  GuardrailsLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-guardrails-lt'
+      LaunchTemplateData:
+        ImageId: !Ref GuardrailsAmiId
+        InstanceType: !Ref GuardrailsInstanceType
+        SecurityGroupIds:
+          - !Ref GuardrailsSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref GuardrailsInstanceProfile
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              Encrypted: true
+              VolumeSize: 100
+              VolumeType: gp3
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            exec > /var/log/guardrails-init.log 2>&1
+            echo "Starting guardrails container deployment..."
+            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+            IMAGE_URI="${GuardrailsImageUri}"
+            CONTAINER_PORT="${GuardrailsContainerPort}"
+            REGISTRY=$(echo "$IMAGE_URI" | cut -d/ -f1)
+            systemctl start docker || true
+            systemctl enable docker || true
+            aws ecr get-login-password --region "$REGION" | \
+              docker login --username AWS --password-stdin "$REGISTRY"
+            docker pull "$IMAGE_URI"
+            docker run -d --restart always --gpus all \
+              -p "$CONTAINER_PORT:$CONTAINER_PORT" \
+              --name guardrails \
+              "$IMAGE_URI"
+            echo "Guardrails container started on port $CONTAINER_PORT"
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-guardrails'
+
+  GuardrailsAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-guardrails-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref GuardrailsLaunchTemplate
+        Version: !GetAtt GuardrailsLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref GuardrailsMinCapacity
+      MaxSize: !Ref GuardrailsMaxCapacity
+      DesiredCapacity: !Ref GuardrailsDesiredCapacity
+      VPCZoneIdentifier: !Ref PrivateSubnetIds
+      TargetGroupARNs:
+        - !Ref GuardrailsTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails'
+          PropagateAtLaunch: true
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  GuardrailsAlbDnsName:
+    Description: Internal ALB DNS name fronting the AI Guardrails container
+    Value: !GetAtt GuardrailsAlb.DNSName
+
+  GuardrailsHostUrl:
+    Description: >
+      Guardrails host URL to configure on clients (e.g. an AI Gateway
+      guardrails endpoint).
+    Value: !Sub 'https://${GuardrailsDomainName}'
+
+  GuardrailsCertificateArn:
+    Description: ACM ARN of the self-signed ALB certificate
+    Value: !GetAtt GuardrailsCertificate.CertificateArn
+
+  CertParameterName:
+    Description: >
+      SSM parameter holding the ALB certificate PEM. Import this cert into
+      any client that must trust the Guardrails ALB endpoint.
+    Value: !Sub '/${AWS::StackName}/guardrails-cert'
+
+  GuardrailsAsgName:
+    Description: Guardrails Auto Scaling Group name
+    Value: !Ref GuardrailsAutoScalingGroup
+
+  PrivateHostedZoneId:
+    Value: !Ref PrivateHostedZone

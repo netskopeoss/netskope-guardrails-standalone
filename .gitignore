@@ -1,0 +1,27 @@
+# Secrets / local env
+.env
+*.pem
+*.key
+
+# Scratch / reference downloads (not part of the repo)
+source/
+
+# Local working docs (contain account/VPC IDs)
+INTEGRATION-RUNBOOK.md
+HANDOVER-guardrails.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Generated Word deliverables (internal endpoint names)
+*.docx
