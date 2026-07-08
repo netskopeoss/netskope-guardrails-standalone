@@ -4,33 +4,42 @@ Project instructions for Claude Code working in this repository.
 
 ## Project Overview
 
-This repo deploys **only** the Netskope **AI Guardrails** service into AWS. It
-is a standalone carve-out of the
+This repo deploys **only** the Netskope **AI Guardrails on Demand** service
+into AWS. It is a standalone carve-out of the
 [AWS AI Gateway Reference Architecture by jharris-ns](https://github.com/jharris-ns/AWS-AIGW-Reference-Architecture)
 — the AI Gateway and DLP On Demand (DLPoD) components are intentionally **not**
 present. It mirrors the structure of the sibling DLPoD standalone repo.
 
-AI Guardrails is a GPU-hosted LLM container (content moderation / prompt and
-response safety) that fronts an internal Application Load Balancer with a
-self-signed CA cert, so an AI Gateway (or any RFC1918 client) can call it over
-HTTPS.
+**AI Guardrails on Demand ships as a Netskope Virtual Private Edge (VPE)
+appliance VM** (AMI name: `Virtual Private Edge (VPE) - x.y.z`). It is *not* a
+GPU container. The appliance exposes the AI Guardrails on Demand API on HTTP
+`:8080` (explicit-proxy mode). GPU-based LLM detection is **optional** and runs
+on a **separate** VM the VPE connects to via the service template (Container
+URL/IP + OAuth2) — that GPU backend is out of scope for this template.
 
 ## Architecture
 
-1. **ASG launches a GPU instance** from a Deep Learning AMI (NVIDIA drivers +
-   Docker preinstalled).
-2. **EC2 UserData self-starts the container**: fetch region from IMDSv2 →
-   `aws ecr get-login-password` → `docker login` → `docker pull <ImageUri>` →
-   `docker run -d --restart always --gpus all -p <port>:<port>`.
-3. The instance registers with the **internal ALB target group** (HTTP on the
-   container port); the ALB serves **HTTPS 443** with a self-signed cert.
-4. **Route 53** private zone resolves `guardrails.aigw.internal` to the ALB.
+1. **ASG launches the VPE appliance** from the Netskope-shared VPE AMI on a
+   general-purpose CPU instance (≥ 8 vCPU / 32 GiB).
+2. The appliance boots and reaches the **Netskope management plane** outbound
+   (via NAT) to be managed.
+3. An **internal ALB** serves **HTTPS 443** (self-signed cert) and forwards to
+   the appliance API on **HTTP :8080**; **Route 53** resolves
+   `guardrails.aigw.internal` to the ALB.
+4. **Activation is manual** (Netskope Beta): enroll the node + attach the
+   platform and AI Guardrails service templates in the Netskope UI (*Settings →
+   Security Cloud Platform → On-Premises Infrastructure*), then generate the
+   dataplane cert from the VPE CLI
+   (`request certificate generate forward-proxy self-signed …`).
 
-**Key difference from DLPoD:** there are **no** ASG lifecycle hooks, SNS, Step
-Functions, activation/tethering Lambdas, or paramiko layer. The container
-self-starts via UserData, so the only Lambda is the inline self-signed-cert
-custom resource. Deployment is a single `aws cloudformation deploy` — **no
-prebuilt S3 artifacts** are required.
+**Key differences from DLPoD:** the container/GPU model was wrong for this
+image — corrected to a VPE appliance. There are **no** lifecycle hooks, SNS,
+Step Functions, tethering/activation Lambdas, paramiko layer, ECR pull, GPU,
+or UserData bootstrap. The only Lambda is the inline self-signed-cert custom
+resource, so deployment is a single `aws cloudformation deploy` — **no S3
+artifacts**. Activation is done by hand rather than automated (unlike DLPoD),
+because VPE enrollment is undocumented/Beta. The ASG uses an **EC2** health
+check (not ELB) so an un-activated appliance isn't replaced in a loop.
 
 ## Repository Layout
 
@@ -41,51 +50,49 @@ prebuilt S3 artifacts** are required.
 
 ## Deployment
 
-The template is fully self-contained (the cert generator is inlined), so there
-is no build step and no S3 upload.
+The template is fully self-contained (cert generator inlined), so there is no
+build step and no S3 upload. Deploy in the AMI's region (**us-east-1** for the
+current share):
 
 ```bash
 aws cloudformation deploy \
   --template-file templates/guardrails-standalone.yaml \
   --stack-name netskope-guardrails \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region us-west-1 \
+  --region us-east-1 \
   --parameter-overrides \
     VpcId=vpc-xxxx \
     AlbSubnetIds=subnet-a,subnet-b \
     PrivateSubnetIds=subnet-c \
-    GuardrailsAmiId=ami-xxxx \
-    GuardrailsImageUri=<account>.dkr.ecr.us-west-1.amazonaws.com/aisecurityllm:latest
+    GuardrailsAmiId=ami-0685e188113ed2f85
 ```
 
 ## Operations Quick Reference
 
 | Task | Command |
 |------|---------|
-| Guardrails instance state | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-guardrails-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" --output table` |
-| Target health (is the container serving?) | `aws elbv2 describe-target-health --target-group-arn <tg-arn> --output table` |
-| Container boot log (on instance) | `sudo cat /var/log/guardrails-init.log` |
+| Appliance instance state | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-guardrails-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" --output table` |
+| ALB target health | `aws elbv2 describe-target-health --target-group-arn <tg-arn> --output table` |
 | Get ALB cert PEM | `aws ssm get-parameter --name /<stack>/guardrails-cert --query Parameter.Value --output text` |
 
 ## Rules & Gotchas
 
-- **GPU quota / AZ availability.** g4dn / g5 instances need vCPU quota (the
-  "Running On-Demand G and VT instances" limit) and capacity in the chosen
-  AZs. Put `PrivateSubnetIds` in AZs that have the instance type.
-- **Deep Learning AMI required.** The AMI must have NVIDIA drivers + Docker +
-  the NVIDIA container toolkit so `docker run --gpus all` works. A plain
-  Amazon Linux AMI will fail to start the container.
-- **ALB subnets need ≥ 8 free IPs each** — `/28` subnets are too small.
-- **Private subnets need outbound internet** (NAT) so the instance can reach
-  ECR to pull the image.
-- **`HostedZoneName` must be unique per VPC.** If an AI Gateway or DLPoD
-  deployment already associated `aigw.internal` with the VPC, pick a different
-  name to avoid a Route 53 resolution collision.
-- The container image comes from a **Netskope-provided ECR URI** — pass it as
-  `GuardrailsImageUri`.
+- **VPE appliance, not a container.** No ECR, no GPU, no `docker run` on this
+  instance. If you find yourself adding a Deep Learning AMI, `GuardrailsImageUri`,
+  or GPU instance types, stop — that was the wrong (earlier) model.
+- **CPU sizing:** ≥ 8 vCPU / 32 GiB (default `m5.2xlarge`).
+- **AMI is shared in us-east-1.** Cross-region copy needs Netskope to also
+  share the backing snapshot (and KMS key if encrypted); otherwise deploy in
+  us-east-1.
+- **ALB subnets need ≥ 8 free IPs each** — `/28` is too small.
+- **Private subnets need outbound internet (NAT)** for the management plane.
+- **`HostedZoneName` must be unique per VPC** — avoid collision with an AI
+  Gateway / DLPoD `aigw.internal` zone.
+- **Activation is manual (Beta)** — the template does not enroll the node or
+  generate the dataplane cert.
+- **ASG health check is EC2, not ELB** — deliberate, so the un-activated
+  appliance (failing the API health check) isn't terminated/replaced.
 - **Don't commit secrets.** `.env`, `*.pem`, `*.key` are git-ignored.
-- The `source/` directory (if present locally) is scratch/reference only and
-  is git-ignored.
 
 ## Attribution
 
@@ -94,5 +101,7 @@ Derived from jharris-ns/AWS-AIGW-Reference-Architecture (Apache-2.0). See
 
 ## Related Resources
 
+- [AI Guardrails on Demand](https://docs.netskope.com/en/ai-guardrails-on-demand)
+- [Configuring Virtual Private Edge](https://docs.netskope.com/en/configuring-virtual-private-edge)
 - [Netskope AI Gateway Documentation](https://docs.netskope.com/en/ai-gateway/)
 - [Upstream reference architecture](https://github.com/jharris-ns/AWS-AIGW-Reference-Architecture)

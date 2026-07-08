@@ -1,19 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Netskope AI Guardrails — standalone deployment.
-
-  Deploys the AI Guardrails LLM container onto a GPU instance in an existing
-  VPC, behind a private Application Load Balancer with a self-signed CA
-  certificate. The container self-starts on boot via EC2 UserData (ECR login
-  -> docker pull -> docker run --gpus all) — there are no lifecycle hooks,
-  SNS, Step Functions, or tethering Lambdas. The only Lambda is the inline
-  self-signed-certificate custom resource.
-
-  Carved out of the AWS-AIGW Reference Architecture (jharris-ns) to deploy
-  ONLY the AI Guardrails service, with no AI Gateway or DLPoD resources.
-
-  No prebuilt artifacts are required — the entire stack (including the cert
-  generator) is inlined, so deployment is a single `aws cloudformation deploy`.
+  Netskope AI Guardrails on Demand (Virtual Private Edge / VPE) — standalone
+  deployment. Provisions the VPE appliance in an ASG behind a private ALB with
+  a self-signed cert (HTTPS 443 -> appliance API on HTTP :8080) at a Route 53
+  private name. INFRASTRUCTURE ONLY: tenant-side activation (enroll node,
+  attach the AI Guardrails service template, generate the dataplane cert via
+  the VPE CLI) is a manual step — see README. The optional GPU LLM backend is
+  a separate VM and is NOT deployed here. Carved from the AWS-AIGW Reference
+  Architecture (jharris-ns); the only Lambda (inline cert generator) makes this
+  a single `aws cloudformation deploy` with no prebuilt artifacts.
 
 # ============================================================
 # Parameters
@@ -21,7 +16,7 @@ Description: >
 Parameters:
   VpcId:
     Type: AWS::EC2::VPC::Id
-    Description: Existing VPC to deploy AI Guardrails into.
+    Description: Existing VPC to deploy AI Guardrails on Demand into.
 
   AlbSubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
@@ -34,47 +29,43 @@ Parameters:
     Type: List<AWS::EC2::Subnet::Id>
     Description: >
       One or two private subnets WITH outbound internet (NAT gateway) for the
-      GPU instance(s). Outbound is required so the instance can authenticate
-      to ECR and pull the guardrails container image. Use AZs that have GPU
-      capacity for the chosen instance type.
+      appliance. Outbound is required so the VPE can reach the Netskope
+      management plane to enroll and stay managed.
 
   GuardrailsAmiId:
     Type: AWS::EC2::Image::Id
     Description: >
-      Deep Learning Base AMI ID with NVIDIA drivers and Docker preinstalled
-      (e.g. AWS "Deep Learning Base OSS Nvidia Driver GPU AMI"). Must support
-      the chosen GPU instance type.
+      Netskope AI Guardrails on Demand (Virtual Private Edge / VPE) appliance
+      AMI ID, shared with your account by Netskope. Must be in the region you
+      deploy into (the shared image is in us-east-1; copy it or deploy in the
+      same region as the share).
 
   GuardrailsInstanceType:
     Type: String
-    Default: g4dn.xlarge
+    Default: m5.2xlarge
     AllowedValues:
-      - g4dn.xlarge
-      - g4dn.2xlarge
-      - g5.xlarge
-      - g5.2xlarge
+      - m5.2xlarge
+      - m5.4xlarge
+      - m6i.2xlarge
+      - m6i.4xlarge
     Description: >
-      GPU instance type for guardrails. Requires 1 NVIDIA GPU with >= 16 GB
-      VRAM. g4dn (T4) is cheapest and broadly available; g5 (A10G) is faster
-      but may be quota/AZ constrained.
+      Instance type for the VPE appliance. Netskope virtual appliances need a
+      general-purpose instance with >= 8 vCPU and >= 32 GiB RAM (m5.2xlarge
+      meets the minimum). This is a CPU appliance — it does NOT need a GPU;
+      GPU-based LLM detection runs on a separate VM connected via the service
+      template.
 
-  GuardrailsImageUri:
-    Type: String
-    Description: >
-      ECR image URI for the AI Guardrails LLM container, e.g.
-      196420666220.dkr.ecr.us-west-1.amazonaws.com/aisecurityllm:latest.
-      The instance authenticates to this registry via its IAM role and pulls
-      the image on boot. Required.
-
-  GuardrailsContainerPort:
+  GuardrailsApiPort:
     Type: Number
     Default: 8080
-    Description: Port the guardrails container listens on (published on the host and targeted by the ALB).
+    Description: >
+      Port the AI Guardrails on Demand API listens on (explicit-proxy mode).
+      The ALB target group forwards HTTP to this port. Default 8080.
 
   GuardrailsHealthCheckPath:
     Type: String
     Default: /
-    Description: ALB health check path for the guardrails container.
+    Description: ALB health check path for the appliance API.
 
   HostedZoneName:
     Type: String
@@ -90,27 +81,26 @@ Parameters:
     Type: String
     Default: guardrails.aigw.internal
     Description: >
-      Internal FQDN clients (e.g. an AI Gateway) use to reach the Guardrails
-      ALB. Must be within HostedZoneName. The self-signed ALB certificate
-      CN/SAN matches this name.
+      Internal FQDN clients use to reach the Guardrails ALB. Must be within
+      HostedZoneName. The self-signed ALB certificate CN/SAN matches this name.
 
   GuardrailsMinCapacity:
     Type: Number
     Default: 1
     MinValue: 1
-    Description: Minimum number of guardrails GPU instances.
+    Description: Minimum number of appliance instances.
 
   GuardrailsMaxCapacity:
     Type: Number
     Default: 2
     MinValue: 1
-    Description: Maximum number of guardrails GPU instances (allows manual scale-out).
+    Description: Maximum number of appliance instances (allows manual scale-out).
 
   GuardrailsDesiredCapacity:
     Type: Number
     Default: 1
     MinValue: 1
-    Description: Desired number of guardrails GPU instances (typically 1).
+    Description: Desired number of appliance instances (typically 1).
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -122,12 +112,11 @@ Metadata:
           - AlbSubnetIds
           - PrivateSubnetIds
       - Label:
-          default: Guardrails GPU Appliance & Container
+          default: Guardrails Appliance (VPE)
         Parameters:
           - GuardrailsAmiId
           - GuardrailsInstanceType
-          - GuardrailsImageUri
-          - GuardrailsContainerPort
+          - GuardrailsApiPort
           - GuardrailsHealthCheckPath
       - Label:
           default: DNS & Certificate
@@ -141,10 +130,9 @@ Metadata:
           - GuardrailsDesiredCapacity
           - GuardrailsMaxCapacity
     ParameterLabels:
-      GuardrailsAmiId: { default: Guardrails GPU AMI ID }
-      GuardrailsImageUri: { default: Guardrails ECR Image URI }
+      GuardrailsAmiId: { default: Guardrails on Demand (VPE) AMI ID }
       GuardrailsDomainName: { default: Guardrails Internal FQDN }
-      GuardrailsContainerPort: { default: Container Port }
+      GuardrailsApiPort: { default: Appliance API Port }
 
 Resources:
 
@@ -160,8 +148,8 @@ Resources:
       Value: pending
       Description: >
         Self-signed ALB certificate PEM (populated by the cert generator
-        custom resource). Import this into your AI Gateway / client trust
-        store so it can validate the Guardrails ALB endpoint.
+        custom resource). Import this into any client trust store so it can
+        validate the Guardrails ALB endpoint.
 
   # =========================================================
   # Security Groups
@@ -170,7 +158,7 @@ Resources:
   GuardrailsAlbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Internal ALB for AI Guardrails service
+      GroupDescription: Internal ALB for AI Guardrails on Demand service
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -190,10 +178,10 @@ Resources:
           Description: HTTPS from RFC1918 192.x
       SecurityGroupEgress:
         - IpProtocol: tcp
-          FromPort: !Ref GuardrailsContainerPort
-          ToPort: !Ref GuardrailsContainerPort
+          FromPort: !Ref GuardrailsApiPort
+          ToPort: !Ref GuardrailsApiPort
           CidrIp: '0.0.0.0/0'
-          Description: HTTP to guardrails container
+          Description: HTTP to appliance API
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-guardrails-alb-sg'
@@ -201,18 +189,33 @@ Resources:
   GuardrailsSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: AI Guardrails GPU instances
+      GroupDescription: AI Guardrails on Demand (VPE) appliance
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
-          FromPort: !Ref GuardrailsContainerPort
-          ToPort: !Ref GuardrailsContainerPort
+          FromPort: !Ref GuardrailsApiPort
+          ToPort: !Ref GuardrailsApiPort
           SourceSecurityGroupId: !Ref GuardrailsAlbSecurityGroup
-          Description: Container port from ALB
+          Description: API port from ALB
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '10.0.0.0/8'
+          Description: SSH for VPE CLI activation (RFC1918 10.x)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '172.16.0.0/12'
+          Description: SSH for VPE CLI activation (RFC1918 172.x)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '192.168.0.0/16'
+          Description: SSH for VPE CLI activation (RFC1918 192.x)
       SecurityGroupEgress:
         - IpProtocol: '-1'
           CidrIp: '0.0.0.0/0'
-          Description: All outbound (ECR pull, CloudWatch)
+          Description: All outbound (Netskope management plane, NTP, upgrades)
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-guardrails-sg'
@@ -336,7 +339,7 @@ Resources:
       CertVersion: '1'
 
   # =========================================================
-  # Private ALB fronting the Guardrails container
+  # Private ALB fronting the Guardrails appliance
   # =========================================================
 
   GuardrailsAlb:
@@ -357,11 +360,11 @@ Resources:
     Properties:
       Name: !Sub '${AWS::StackName}-guardrails-tg'
       Protocol: HTTP
-      Port: !Ref GuardrailsContainerPort
+      Port: !Ref GuardrailsApiPort
       VpcId: !Ref VpcId
       TargetType: instance
       HealthCheckProtocol: HTTP
-      HealthCheckPort: !Sub '${GuardrailsContainerPort}'
+      HealthCheckPort: !Sub '${GuardrailsApiPort}'
       HealthCheckPath: !Ref GuardrailsHealthCheckPath
       HealthCheckIntervalSeconds: 30
       HealthCheckTimeoutSeconds: 10
@@ -387,55 +390,10 @@ Resources:
           TargetGroupArn: !Ref GuardrailsTargetGroup
 
   # =========================================================
-  # Guardrails GPU appliance — IAM, Launch Template + ASG
-  # Container self-starts via UserData (ECR pull + docker run).
+  # Guardrails appliance — Launch Template + Auto Scaling Group
+  # VPE appliance boots and enrolls to the Netskope tenant; no
+  # UserData bootstrap and no instance IAM profile are required.
   # =========================================================
-
-  GuardrailsRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub '${AWS::StackName}-guardrails-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ec2.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: EcrPullAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: EcrAuth
-                Effect: Allow
-                Action: ecr:GetAuthorizationToken
-                Resource: '*'
-              - Sid: EcrPull
-                Effect: Allow
-                Action:
-                  - ecr:BatchCheckLayerAvailability
-                  - ecr:GetDownloadUrlForLayer
-                  - ecr:BatchGetImage
-                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
-        - PolicyName: CloudWatchLogs
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: WriteLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
-
-  GuardrailsInstanceProfile:
-    Type: AWS::IAM::InstanceProfile
-    Properties:
-      InstanceProfileName: !Sub '${AWS::StackName}-guardrails-profile'
-      Roles:
-        - !Ref GuardrailsRole
 
   GuardrailsLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
@@ -446,38 +404,15 @@ Resources:
         InstanceType: !Ref GuardrailsInstanceType
         SecurityGroupIds:
           - !Ref GuardrailsSecurityGroup
-        IamInstanceProfile:
-          Name: !Ref GuardrailsInstanceProfile
         BlockDeviceMappings:
-          - DeviceName: /dev/xvda
+          - DeviceName: /dev/sda1
             Ebs:
               Encrypted: true
-              VolumeSize: 100
+              VolumeSize: 300
               VolumeType: gp3
         MetadataOptions:
           HttpTokens: required
           HttpEndpoint: enabled
-        UserData:
-          Fn::Base64: !Sub |
-            #!/bin/bash
-            set -euo pipefail
-            exec > /var/log/guardrails-init.log 2>&1
-            echo "Starting guardrails container deployment..."
-            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-            REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
-            IMAGE_URI="${GuardrailsImageUri}"
-            CONTAINER_PORT="${GuardrailsContainerPort}"
-            REGISTRY=$(echo "$IMAGE_URI" | cut -d/ -f1)
-            systemctl start docker || true
-            systemctl enable docker || true
-            aws ecr get-login-password --region "$REGION" | \
-              docker login --username AWS --password-stdin "$REGISTRY"
-            docker pull "$IMAGE_URI"
-            docker run -d --restart always --gpus all \
-              -p "$CONTAINER_PORT:$CONTAINER_PORT" \
-              --name guardrails \
-              "$IMAGE_URI"
-            echo "Guardrails container started on port $CONTAINER_PORT"
         TagSpecifications:
           - ResourceType: instance
             Tags:
@@ -497,8 +432,8 @@ Resources:
       VPCZoneIdentifier: !Ref PrivateSubnetIds
       TargetGroupARNs:
         - !Ref GuardrailsTargetGroup
-      HealthCheckType: ELB
-      HealthCheckGracePeriod: 600
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 900
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-guardrails'
@@ -509,13 +444,13 @@ Resources:
 # ============================================================
 Outputs:
   GuardrailsAlbDnsName:
-    Description: Internal ALB DNS name fronting the AI Guardrails container
+    Description: Internal ALB DNS name fronting the AI Guardrails on Demand appliance
     Value: !GetAtt GuardrailsAlb.DNSName
 
   GuardrailsHostUrl:
     Description: >
-      Guardrails host URL to configure on clients (e.g. an AI Gateway
-      guardrails endpoint).
+      Guardrails host URL to configure on clients once the appliance is
+      activated (enrolled + service template attached + dataplane cert).
     Value: !Sub 'https://${GuardrailsDomainName}'
 
   GuardrailsCertificateArn:
