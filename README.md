@@ -75,7 +75,7 @@ cert generator) is inlined, so deployment is a single `aws cloudformation deploy
 |-------------|-------|
 | **VPE appliance AMI** | Netskope-shared "Virtual Private Edge (VPE)" AMI for AI Guardrails on Demand. The share is in **us-east-1**; deploy there, or copy the AMI to your region (needs Netskope to also share the backing snapshot). |
 | **Netskope tenant w/ Guardrails on Demand** | Beta feature — have Netskope enable it for your tenant. |
-| **A free CIDR** | `/16`–`/22` for the new VPC (default `10.0.0.0/16`); must not overlap networks you plan to connect. No existing VPC or subnets are needed. |
+| **A free CIDR** | `/16`–`/22` for the new VPC (default `10.5.0.0/16`); must not overlap networks you plan to connect. No existing VPC or subnets are needed. |
 | **EC2 key pair** | Existing key pair in the region, for SSH to the appliance as `nsadmin`. |
 | **In-VPC CLI access** | The VPC has no bastion. SSH the appliance for the one-time dataplane-cert CLI step from a host in the VPC, or over peering/VPN/TGW (set `AdditionalClientCidr`). |
 | **AWS CLI** | Configured for the target account/region. |
@@ -103,7 +103,7 @@ aws cloudformation deploy \
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `VpcCidr` | | `10.0.0.0/16` | CIDR for the new VPC (`/16`–`/22`); four `/24` subnets are carved from it. |
+| `VpcCidr` | | `10.5.0.0/16` | CIDR for the new VPC (`/16`–`/22`); four `/24` subnets are carved from it. |
 | `AdditionalClientCidr` | | *(empty)* | Optional extra CIDR allowed to reach the ALB (443) and appliance (SSH). |
 | `GuardrailsAmiId` | ✅ | — | Netskope VPE appliance AMI ID. |
 | `GuardrailsKeyName` | ✅ | — | Existing EC2 key pair for SSH as `nsadmin`. |
