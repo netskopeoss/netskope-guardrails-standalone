@@ -93,7 +93,7 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM \
   --region us-east-1 \
   --parameter-overrides \
-    GuardrailsAmiId=ami-0685e188113ed2f85 \
+    GuardrailsAmiId=ami-0f0bcf2c92095dca3 \
     GuardrailsKeyName=my-key-pair
 ```
 
