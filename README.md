@@ -21,13 +21,13 @@ extracting just the Guardrails slice into a self-contained CloudFormation stack.
 
 ## What gets deployed
 
-The VPE appliance in a single-instance ASG, fronted by a private ALB that
-serves HTTPS 443 and forwards to the appliance's AI Guardrails on Demand API
-on HTTP `:8080`.
+A **new VPC with all networking**, then the VPE appliance in a single-instance
+ASG, fronted by a private ALB that serves HTTPS 443 and forwards to the
+appliance's AI Guardrails on Demand API on HTTP `:8080`.
 
 ```
                          ┌─────────────────────────────────────────┐
-                         │                  VPC                     │
+                         │      new VPC (private subnets, 2 AZs)    │
    client / AI Gateway   │                                          │
    ───────────────────►  │   Route53 (guardrails.aigw.internal)     │
    https://guardrails...  │            │                            │
@@ -40,7 +40,8 @@ on HTTP `:8080`.
                          │            ▲                            │  mgmt plane
                          │            │ SSH (manual VPE CLI)        │  (via NAT)
                          │        operator / bastion               │
-                         └─────────────────────────────────────────┘
+                         └───────────────┬─────────────────────────┘
+                              public subnet: NAT GW ── IGW ──► internet
 
    (optional) GPU LLM detection backend = a SEPARATE VM the VPE connects to
    via the service template — NOT deployed by this stack.
@@ -48,15 +49,20 @@ on HTTP `:8080`.
 
 **Resources created:**
 
+- **VPC and networking** (same layout as the AI Gateway reference
+  architecture): VPC, internet gateway, 2 public + 2 private `/24` subnets
+  across two AZs, one NAT gateway + EIP, public/private route tables, and an S3
+  gateway endpoint. The ALB and appliance run in the private subnets.
 - VPE appliance — EC2 Launch Template + Auto Scaling Group (Netskope VPE AMI,
-  general-purpose CPU instance, 300 GB encrypted gp3, IMDSv2 required).
+  general-purpose CPU instance, 1 TB encrypted gp3, IMDSv2 required).
 - Internal Application Load Balancer + Target Group (HTTP to the appliance API
   port) + HTTPS 443 listener.
 - A self-signed **CA certificate**, generated inline (Lambda custom resource),
   imported to ACM and stored in SSM Parameter Store.
 - Route 53 private hosted zone resolving `guardrails.aigw.internal` to the ALB.
-- Two security groups (ALB; appliance — API from ALB + SSH from RFC1918 for the
-  CLI activation step).
+- Two security groups (ALB: 443 from the VPC CIDR; appliance: API from ALB +
+  SSH from the VPC CIDR for the CLI activation step). Optionally also allow an
+  `AdditionalClientCidr` (peering / VPN / Transit Gateway).
 
 **No prebuilt artifacts, no build step, no GPU, no ECR** — the only Lambda (the
 cert generator) is inlined, so deployment is a single `aws cloudformation deploy`.
@@ -69,9 +75,9 @@ cert generator) is inlined, so deployment is a single `aws cloudformation deploy
 |-------------|-------|
 | **VPE appliance AMI** | Netskope-shared "Virtual Private Edge (VPE)" AMI for AI Guardrails on Demand. The share is in **us-east-1**; deploy there, or copy the AMI to your region (needs Netskope to also share the backing snapshot). |
 | **Netskope tenant w/ Guardrails on Demand** | Beta feature — have Netskope enable it for your tenant. |
-| **Existing VPC** | Private subnets with **outbound internet (NAT)** so the appliance reaches the Netskope management plane. |
-| **2 ALB subnets** | Different AZs, each with **≥ 8 free IPs** (`/24`+ recommended; `/28` is too small). |
-| **In-VPC CLI access** | A bastion / SSM path to SSH the appliance for the one-time dataplane-cert CLI step. |
+| **A free CIDR** | `/16`–`/22` for the new VPC (default `10.0.0.0/16`); must not overlap networks you plan to connect. No existing VPC or subnets are needed. |
+| **EC2 key pair** | Existing key pair in the region, for SSH to the appliance as `nsadmin`. |
+| **In-VPC CLI access** | The VPC has no bastion. SSH the appliance for the one-time dataplane-cert CLI step from a host in the VPC, or over peering/VPN/TGW (set `AdditionalClientCidr`). |
 | **AWS CLI** | Configured for the target account/region. |
 
 ---
@@ -87,10 +93,8 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM \
   --region us-east-1 \
   --parameter-overrides \
-    VpcId=vpc-xxxxxxxx \
-    AlbSubnetIds=subnet-aaaa,subnet-bbbb \
-    PrivateSubnetIds=subnet-cccc \
-    GuardrailsAmiId=ami-0685e188113ed2f85
+    GuardrailsAmiId=ami-0685e188113ed2f85 \
+    GuardrailsKeyName=my-key-pair
 ```
 
 ---
@@ -99,14 +103,14 @@ aws cloudformation deploy \
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `VpcId` | ✅ | — | Existing VPC. |
-| `AlbSubnetIds` | ✅ | — | Two subnets (different AZs) for the internal ALB. |
-| `PrivateSubnetIds` | ✅ | — | Private subnet(s) with NAT for the appliance. |
+| `VpcCidr` | | `10.0.0.0/16` | CIDR for the new VPC (`/16`–`/22`); four `/24` subnets are carved from it. |
+| `AdditionalClientCidr` | | *(empty)* | Optional extra CIDR allowed to reach the ALB (443) and appliance (SSH). |
 | `GuardrailsAmiId` | ✅ | — | Netskope VPE appliance AMI ID. |
+| `GuardrailsKeyName` | ✅ | — | Existing EC2 key pair for SSH as `nsadmin`. |
 | `GuardrailsInstanceType` | | `m5.2xlarge` | CPU general-purpose, ≥ 8 vCPU / 32 GiB (`m5`/`m6i` 2xl–4xl). **No GPU** — GPU detection is a separate VM. |
 | `GuardrailsApiPort` | | `8080` | Appliance API port (ALB target). |
 | `GuardrailsHealthCheckPath` | | `/` | ALB health check path. |
-| `HostedZoneName` | | `aigw.internal` | Route 53 private zone name (unique per VPC). |
+| `HostedZoneName` | | `aigw.internal` | Route 53 private zone name. |
 | `GuardrailsDomainName` | | `guardrails.aigw.internal` | Internal FQDN; matches the cert CN/SAN. |
 | `GuardrailsMinCapacity` | | `1` | Min appliance instances. |
 | `GuardrailsDesiredCapacity` | | `1` | Desired instances (usually 1). |
@@ -162,6 +166,9 @@ The stack gives you a booted, network-reachable VPE appliance behind the ALB.
 | `CertParameterName` | SSM param holding the cert PEM. |
 | `GuardrailsAsgName` | Guardrails Auto Scaling Group name. |
 | `PrivateHostedZoneId` | Route 53 private zone ID. |
+| `VpcId` | ID of the VPC created by the stack (use for peering / TGW attachments). |
+| `PrivateSubnetIds` / `PublicSubnetIds` | Subnet IDs created by the stack. |
+| `NatGatewayPublicIp` | NAT gateway egress IP. |
 
 ---
 
@@ -171,8 +178,9 @@ The stack gives you a booted, network-reachable VPE appliance behind the ALB.
 aws cloudformation delete-stack --stack-name netskope-guardrails --region us-east-1
 ```
 
-This terminates the appliance, removes the ALB, Route 53 zone, cert Lambda,
-role, and the imported ACM certificate. De-enroll the node in the Netskope UI
+This terminates the appliance and removes the ALB, Route 53 zone, cert Lambda,
+role, imported ACM certificate, and the VPC with its NAT gateway, EIP and
+subnets. De-enroll the node in the Netskope UI
 separately.
 
 ---
@@ -199,10 +207,14 @@ NOTICE / LICENSE                        Apache-2.0 + attribution to jharris-ns
 - **AMI region.** The AMI is shared in **us-east-1**. Cross-region copy also
   needs Netskope to share the backing EBS snapshot (and any KMS key), so the
   simplest path is to deploy in us-east-1.
-- **Private subnets need outbound internet (NAT)** so the appliance can reach
-  the Netskope management plane.
-- **`HostedZoneName` is unique per VPC** — if `aigw.internal` is already
-  associated with the VPC (AI Gateway / DLPoD), pick a different name.
+- **Single NAT gateway** (as in the reference architecture) in the first AZ —
+  the appliance needs it to reach the Netskope management plane, and an outage
+  of that AZ cuts private egress in both.
+- **Nothing else in the VPC.** There is no bastion or SSM endpoint; connect via
+  peering/VPN/TGW (`AdditionalClientCidr`) or add your own jump host.
+- **`HostedZoneName`** — if you later associate this VPC with others that
+  resolve the same zone (AI Gateway / DLPoD `aigw.internal`), pick a different
+  name to avoid a collision.
 - **Activation is manual (Beta).** The template does not enroll the node or
   generate the dataplane cert; do those via the Netskope UI + VPE CLI.
 

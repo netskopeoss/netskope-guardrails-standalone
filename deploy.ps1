@@ -1,6 +1,6 @@
 # Deploy the Netskope AI Guardrails on Demand stack.
 #
-#   1) Copy .env.example to .env and fill in your VPC / subnet / AMI IDs.
+#   1) Copy .env.example to .env and fill in your AMI ID / key pair name.
 #   2) Ensure AWS creds work:  aws sts get-caller-identity
 #   3) Run:  ./deploy.ps1
 #
@@ -30,18 +30,18 @@ if ($env:CA_BUNDLE) { $env:AWS_CA_BUNDLE = $env:CA_BUNDLE }
 $region = if ($env:AWS_REGION) { $env:AWS_REGION } else { 'us-east-1' }
 $stack  = if ($env:STACK_NAME) { $env:STACK_NAME } else { 'netskope-guardrails' }
 
-foreach ($req in 'VPC_ID','ALB_SUBNET_IDS','PRIVATE_SUBNET_IDS','GUARDRAILS_AMI_ID') {
+foreach ($req in 'GUARDRAILS_AMI_ID','GUARDRAILS_KEY_NAME') {
     if (-not (Get-Item "env:$req" -ErrorAction SilentlyContinue).Value) {
         throw "Missing required value '$req' in .env"
     }
 }
 
 $overrides = @(
-    "VpcId=$env:VPC_ID",
-    "AlbSubnetIds=$env:ALB_SUBNET_IDS",
-    "PrivateSubnetIds=$env:PRIVATE_SUBNET_IDS",
-    "GuardrailsAmiId=$env:GUARDRAILS_AMI_ID"
+    "GuardrailsAmiId=$env:GUARDRAILS_AMI_ID",
+    "GuardrailsKeyName=$env:GUARDRAILS_KEY_NAME"
 )
+if ($env:VPC_CIDR)               { $overrides += "VpcCidr=$env:VPC_CIDR" }
+if ($env:ADDITIONAL_CLIENT_CIDR) { $overrides += "AdditionalClientCidr=$env:ADDITIONAL_CLIENT_CIDR" }
 if ($env:GUARDRAILS_INSTANCE_TYPE) { $overrides += "GuardrailsInstanceType=$env:GUARDRAILS_INSTANCE_TYPE" }
 if ($env:HOSTED_ZONE_NAME)         { $overrides += "HostedZoneName=$env:HOSTED_ZONE_NAME" }
 if ($env:GUARDRAILS_DOMAIN_NAME)   { $overrides += "GuardrailsDomainName=$env:GUARDRAILS_DOMAIN_NAME" }

@@ -19,6 +19,9 @@ URL/IP + OAuth2) — that GPU backend is out of scope for this template.
 
 ## Architecture
 
+0. **The stack creates its own VPC** (IGW, 2 public + 2 private /24 subnets,
+   one NAT gateway, route tables, S3 gateway endpoint) — mirrors the
+   AI Gateway reference architecture. No existing network is required.
 1. **ASG launches the VPE appliance** from the Netskope-shared VPE AMI on a
    general-purpose CPU instance (≥ 8 vCPU / 32 GiB).
 2. The appliance boots and reaches the **Netskope management plane** outbound
@@ -61,10 +64,8 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM \
   --region us-east-1 \
   --parameter-overrides \
-    VpcId=vpc-xxxx \
-    AlbSubnetIds=subnet-a,subnet-b \
-    PrivateSubnetIds=subnet-c \
-    GuardrailsAmiId=ami-0685e188113ed2f85
+    GuardrailsAmiId=ami-0685e188113ed2f85 \
+    GuardrailsKeyName=my-key-pair
 ```
 
 ## Operations Quick Reference
@@ -84,10 +85,15 @@ aws cloudformation deploy \
 - **AMI is shared in us-east-1.** Cross-region copy needs Netskope to also
   share the backing snapshot (and KMS key if encrypted); otherwise deploy in
   us-east-1.
-- **ALB subnets need ≥ 8 free IPs each** — `/28` is too small.
-- **Private subnets need outbound internet (NAT)** for the management plane.
-- **`HostedZoneName` must be unique per VPC** — avoid collision with an AI
-  Gateway / DLPoD `aigw.internal` zone.
+- **`VpcCidr` must be /16–/22** — four /24 subnets are carved from it with
+  `Fn::Cidr`. Don't overlap networks you'll peer/connect.
+- **ALB + appliance are in the private subnets**; one NAT gateway (first AZ)
+  provides the outbound path to the management plane. Keep the
+  `DependsOn: PrivateRoute` on the ASG.
+- **No bastion/SSM in the VPC.** SG ingress (443, SSH) is limited to `VpcCidr`
+  plus optional `AdditionalClientCidr` (peering/VPN/TGW).
+- **`HostedZoneName`** — avoid collision with an AI Gateway / DLPoD
+  `aigw.internal` zone if you later share DNS across VPCs.
 - **Activation is manual (Beta)** — the template does not enroll the node or
   generate the dataplane cert.
 - **ASG health check is EC2, not ELB** — deliberate, so the un-activated
