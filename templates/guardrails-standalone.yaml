@@ -511,7 +511,6 @@ Resources:
   GuardrailsAlb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: !Sub '${AWS::StackName}-guardrails'
       Scheme: internal
       Type: application
       SecurityGroups:
@@ -526,7 +525,6 @@ Resources:
   GuardrailsTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: !Sub '${AWS::StackName}-guardrails-tg'
       Protocol: HTTP
       Port: !Ref GuardrailsApiPort
       VpcId: !Ref Vpc
