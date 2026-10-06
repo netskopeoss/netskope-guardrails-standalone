@@ -133,22 +133,74 @@ The stack gives you a booted, network-reachable VPE appliance behind the ALB.
    > The ASG uses an **EC2** health check (not ELB), so the appliance is *not*
    > killed while its API health check is still failing pre-activation.
 
-2. **Enroll the VPE node** and **attach templates** in the Netskope UI:
-   *Settings → Security Cloud Platform → On-Premises Infrastructure* — attach a
-   **platform template** and the **AI Guardrails** service template to the node.
+2. **Connect to the appliance CLI.** The VPE is in a private subnet and the
+   stack has no bastion. If you have no peering/VPN, create an EC2 Instance
+   Connect Endpoint in a private subnet (`PrivateSubnetIds` output), then
+   tunnel through it and SSH with your key pair as `nsadmin`:
+   ```bash
+   aws ec2 create-instance-connect-endpoint --subnet-id <private-subnet-id>
+   aws ec2-instance-connect open-tunnel --instance-id <instance-id> --local-port 2222
+   ssh -i <key>.pem -p 2222 nsadmin@localhost
+   ```
+   > The VPE appeared to accept only one SSH session at a time in testing — `exit`
+   > an open session before opening another.
 
-3. **Generate the dataplane certificate from the VPE CLI** (SSH to the
-   appliance from within the VPC):
+3. **Register the node with your tenant.** In the Netskope UI go to *Settings →
+   Security Cloud Platform → On-Premises Infrastructure → Next-Gen →
+   Registration Tokens → Create Token* and copy the token. Then in the VPE CLI:
+   ```
+   configure
+   set dns primary <vpc-resolver-ip>
+   set system registrationkey <token>
+   save
+   exit
+   status tethering
+   ```
+   - `<vpc-resolver-ip>` is the VPC base address + 2 (for the default
+     `10.5.0.0/16`, that is `10.5.0.2`). The node normally picks this up from
+     DHCP (check with `show dns`), so this line is a safe explicit setting.
+   - **Run `save`.** Netskope's doc only lists `set system registrationkey`, but
+     a registration that worked in testing ran `save` afterwards. Entering the
+     key without it left the node `not_registered` (only an `identifier`
+     appeared).
+   - Registration can take up to 20 minutes. `status tethering` should then
+     show your `tenant_url` and a `serial`, and the node appears on the
+     **Next-Gen** page with its hostname and serial number.
+
+4. **Create a platform template and apply it to the node.** In the UI:
+   *Settings → Security Cloud Platform → On-Premises Infrastructure → Next-Gen →
+   Manage Template → Platform Template → New Template*. Enter a template name
+   and the NTP servers, then **Save**. Back on the **Next-Gen** page, click
+   **Appliance Setup** in the **Services** column for your VPE node, choose the
+   template from the **VPE Platform Template** dropdown, and **Save**.
+
+5. **Create the AI Guardrails service template and apply it to the node.** In
+   the UI: *Manage Template → Service Template → New Template*. Enter a
+   **Service template name**, then configure the AI Guardrails service:
+   - **HTTP (Port 8080)** for the API — matches the template's
+     `GuardrailsApiPort`, which the ALB forwards to.
+   - **GPU based AI Guardrails VM** settings, only if you run the optional GPU
+     backend (see step 7).
+   - **Store Matched Content in Netskope** toggle, as you prefer.
+
+   **Save**, then on the **Next-Gen** page click **Appliance Setup** for the
+   node, choose the template from the **VPE Service Template** dropdown, and
+   **Save**. The platform template (step 4) and the service template must both
+   be attached before the API on `:8080` will answer, so the ALB targets stay
+   unhealthy until then.
+
+6. **Generate the dataplane certificate from the VPE CLI:**
    ```
    request certificate generate forward-proxy self-signed \
      common-name <mycert> email-address <admin-email>
    ```
+   A successful run prints `successfully generated self signed ca`.
 
-4. **(Optional) Connect a GPU LLM backend** in the service template (Container
+7. **(Optional) Connect a GPU LLM backend** in the service template (Container
    URL/IP + OAuth2) if you want LLM-based detection. That backend is a separate
    VM — not part of this stack.
 
-5. **Point clients at the service** using the `GuardrailsHostUrl` output
+8. **Point clients at the service** using the `GuardrailsHostUrl` output
    (`https://guardrails.aigw.internal`). Clients that must trust the ALB need
    the self-signed CA cert from SSM:
    ```bash
