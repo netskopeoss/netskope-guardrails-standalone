@@ -159,10 +159,10 @@ The stack gives you a booted, network-reachable VPE appliance behind the ALB.
    - `<vpc-resolver-ip>` is the VPC base address + 2 (for the default
      `10.5.0.0/16`, that is `10.5.0.2`). The node normally picks this up from
      DHCP (check with `show dns`), so this line is a safe explicit setting.
-   - **Run `save`.** Netskope's doc only lists `set system registrationkey`, but
-     a registration that worked in testing ran `save` afterwards. Entering the
-     key without it left the node `not_registered` (only an `identifier`
-     appeared).
+   - **You must run `save`.** Netskope's doc only lists
+     `set system registrationkey`, but the key is not applied until you `save`.
+     Without it the node stays `not_registered` (only an `identifier` appears)
+     no matter how long you wait.
    - Registration can take up to 20 minutes. `status tethering` should then
      show your `tenant_url` and a `serial`, and the node appears on the
      **Next-Gen** page with its hostname and serial number.
