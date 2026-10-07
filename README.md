@@ -83,6 +83,8 @@ cert generator) is inlined, so deployment is a single `aws cloudformation deploy
 ---
 
 ## Quick start
+After downloading from github run ./deploy.ps1. If you want to change the default add .env file with your changes. Use the .env.example for help. 
+You can also follow this - https://community.netskope.com/artificial-intelligence-and-machine-learning-10/netskope-ai-guardrails-on-demand-9034
 
 Deploy in **us-east-1** (where the AMI is shared):
 
