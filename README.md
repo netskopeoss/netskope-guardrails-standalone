@@ -12,8 +12,7 @@ extracting just the Guardrails slice into a self-contained CloudFormation stack.
 > certificate generator are derived from jharris-ns's project, used under the
 > Apache License 2.0. See [`NOTICE`](NOTICE) and [`LICENSE`](LICENSE).
 
-> ⚠️ **Beta / infrastructure-only.** Netskope AI Guardrails on Demand is a Beta
-> feature. This template stands up the **AWS infrastructure**; **tenant-side
+> ⚠️ This template stands up the **AWS infrastructure**; **tenant-side
 > activation is manual** (see [After deployment](#after-deployment)). Contact
 > Netskope Support / your SE to enable the feature and get the appliance AMI.
 
@@ -74,7 +73,7 @@ cert generator) is inlined, so deployment is a single `aws cloudformation deploy
 | Requirement | Notes |
 |-------------|-------|
 | **VPE appliance AMI** | Netskope-shared "Virtual Private Edge (VPE)" AMI for AI Guardrails on Demand. The share is in **us-east-1**; deploy there, or copy the AMI to your region (needs Netskope to also share the backing snapshot). |
-| **Netskope tenant w/ Guardrails on Demand** | Beta feature — have Netskope enable it for your tenant. |
+| **Netskope tenant w/ Guardrails on Demand** | Have Netskope enable it for your tenant. |
 | **A free CIDR** | `/16`–`/22` for the new VPC (default `10.5.0.0/16`); must not overlap networks you plan to connect. No existing VPC or subnets are needed. |
 | **EC2 key pair** | Existing key pair in the region, for SSH to the appliance as `nsadmin`. |
 | **In-VPC CLI access** | The VPC has no bastion. SSH the appliance for the one-time dataplane-cert CLI step from a host in the VPC, or over peering/VPN/TGW (set `AdditionalClientCidr`). |
@@ -123,7 +122,7 @@ aws cloudformation deploy \
 ## After deployment
 
 The stack gives you a booted, network-reachable VPE appliance behind the ALB.
-**Activation is manual** (Netskope Beta — automation is incomplete):
+**Activation is manual**:
 
 1. **Confirm the instance is up.**
    ```bash
@@ -320,7 +319,7 @@ NOTICE / LICENSE                        Apache-2.0 + attribution to jharris-ns
 - **`HostedZoneName`** — if you later associate this VPC with others that
   resolve the same zone (AI Gateway / DLPoD `aigw.internal`), pick a different
   name to avoid a collision.
-- **Activation is manual (Beta).** The template does not enroll the node or
+- **Activation is manual.** The template does not enroll the node or
   generate the dataplane cert; do those via the Netskope UI + VPE CLI.
 
 ## License
